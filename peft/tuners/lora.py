@@ -78,8 +78,14 @@ class LoraConfig(PeftConfig):
         default=0,
         metadata={"help": "use top k"},
     )
+    adapter_type: str = field(
+        default="lora",
+        metadata={"help": "Adapter type. Supported values: 'lora' and 'svd_lora'."},
+    )
 
     def __post_init__(self):
+        if self.adapter_type not in {"lora", "svd_lora"}:
+            raise ValueError("adapter_type must be either 'lora' or 'svd_lora'")
         self.peft_type = PeftType.LORA
 
 
@@ -117,6 +123,7 @@ class LoraModel(torch.nn.Module):
             "adaptive": self.peft_config.adaptive,
             "idx": self.peft_config.idx,
             "k": self.peft_config.k,
+            "adapter_type": self.peft_config.adapter_type,
         }
 
         key_list = [key for key, _ in self.model.named_modules()]
@@ -193,6 +200,7 @@ class LoraModel(torch.nn.Module):
                         adaptive=self.peft_config.adaptive,
                         idx=self.peft_config.idx,
                         k=self.peft_config.k,
+                        adapter_type=self.peft_config.adapter_type,
                     )
 
                 self._replace_module(parent, target_name, new_module, target)
@@ -222,6 +230,11 @@ class LoraModel(torch.nn.Module):
         for name, module in new_module.named_modules():
             if "lora_" in name:
                 module.to(old_module.weight.device)
+        for name, param in new_module.named_parameters():
+            if "lora_" in name:
+                param.data = param.data.to(old_module.weight.device)
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.to(old_module.weight.device)
 
     def __getattr__(self, name: str):
         try:
@@ -237,9 +250,13 @@ class LoraLayer:
         lora_alpha: int,
         lora_dropout: float,
         merge_weights: bool,
+        adapter_type: str = "lora",
     ):
         self.r = r
         self.lora_alpha = lora_alpha
+        if adapter_type not in {"lora", "svd_lora"}:
+            raise ValueError("adapter_type must be either 'lora' or 'svd_lora'")
+        self.adapter_type = adapter_type
         if lora_dropout > 0.0:
             self.lora_dropout = nn.Dropout(p=lora_dropout)
         else:
@@ -247,6 +264,22 @@ class LoraLayer:
         self.merged = False
         self.merge_weights = merge_weights
         self.disable_adapters = False
+
+    def _apply_svd_lora(self, expert_idx: int, hidden: torch.Tensor) -> torch.Tensor:
+        if self.adapter_type != "svd_lora":
+            return hidden
+
+        svd_e = getattr(self, f"lora_svd_e{expert_idx}").to(dtype=hidden.dtype, device=hidden.device)
+        if hidden.shape[-1] == svd_e.shape[0]:
+            return hidden * svd_e
+
+        if hidden.shape[-1] % svd_e.shape[0] == 0:
+            repeat = hidden.shape[-1] // svd_e.shape[0]
+            return hidden * svd_e.repeat(repeat)
+
+        raise ValueError(
+            f"SVD-LoRA rank vector shape {tuple(svd_e.shape)} is incompatible with hidden shape {tuple(hidden.shape)}"
+        )
 
 
 class Linear(nn.Linear, LoraLayer):
@@ -264,6 +297,7 @@ class Linear(nn.Linear, LoraLayer):
         adaptive: bool = True,
         idx: int = 0,
         k: int = 0,
+        adapter_type: str = "lora",
         **kwargs,
     ):
         self.r = r  
@@ -276,7 +310,14 @@ class Linear(nn.Linear, LoraLayer):
         
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
+        LoraLayer.__init__(
+            self,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=merge_weights,
+            adapter_type=adapter_type,
+        )
         
         if r > 0:
             
@@ -288,6 +329,8 @@ class Linear(nn.Linear, LoraLayer):
             for i in range(self.lora_num):
                 setattr(self, f"lora_A{i}", nn.Linear(in_features, r, bias=False))
                 setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
+                if self.adapter_type == "svd_lora":
+                    setattr(self, f"lora_svd_e{i}", nn.Parameter(torch.ones(r)))
             self.scaling = self.lora_alpha / self.r
             self.weight.requires_grad = False
         
@@ -305,6 +348,8 @@ class Linear(nn.Linear, LoraLayer):
                     nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
                 if hasattr(self, f"lora_B{i}"):
                     getattr(self, f"lora_B{i}").weight.data.zero_()
+                if hasattr(self, f"lora_svd_e{i}"):
+                    getattr(self, f"lora_svd_e{i}").data.fill_(1.0)
 
             if hasattr(self, "lora_route"):
                 nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
@@ -369,7 +414,7 @@ class Linear(nn.Linear, LoraLayer):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
 
-                            lora_A_output = lora_A(dropped_x)
+                            lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                             expert_output = lora_B(lora_A_output)
 
                             masked_weights = torch.zeros_like(expert_weights)
@@ -403,7 +448,7 @@ class Linear(nn.Linear, LoraLayer):
                                 lora_A = getattr(self, f"lora_A{i}")
                                 lora_B = getattr(self, f"lora_B{i}")
 
-                                lora_A_output = lora_A(dropped_x)
+                                lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                                 expert_output = lora_B(lora_A_output)
 
                                 masked_weights = torch.zeros_like(expert_weights)
@@ -416,7 +461,7 @@ class Linear(nn.Linear, LoraLayer):
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
-                            lora_A_output = lora_A(dropped_x)
+                            lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                             scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
                             lora_output = lora_B(lora_A_output)
                             result = result + scaled_route * lora_output * self.scaling
@@ -455,6 +500,7 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
         adaptive: bool = False,
         idx: int = 0,
         k: int = 0,
+        adapter_type: str = "lora",
         **kwargs,
     ):
         bnb.nn.Linear8bitLt.__init__(
@@ -467,7 +513,14 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
             threshold=kwargs.get("threshold", 0.0),
             index=kwargs.get("index", None),
         )
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
+        LoraLayer.__init__(
+            self,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=False,
+            adapter_type=adapter_type,
+        )
         
         self.lora_num = lora_nums
         self.adaptive = adaptive
@@ -483,6 +536,8 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
             for i in range(self.lora_num):
                 setattr(self, f"lora_A{i}", nn.Linear(in_features, r, bias=False))
                 setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
+                if self.adapter_type == "svd_lora":
+                    setattr(self, f"lora_svd_e{i}", nn.Parameter(torch.ones(r)))
                 
             self.scaling = self.lora_alpha / self.r
             self.weight.requires_grad = False
@@ -495,6 +550,8 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                     nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
                 if hasattr(self, f"lora_B{i}"):
                     getattr(self, f"lora_B{i}").weight.data.zero_()
+                if hasattr(self, f"lora_svd_e{i}"):
+                    getattr(self, f"lora_svd_e{i}").data.fill_(1.0)
             if hasattr(self, "lora_route"):
                 nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
 
@@ -541,7 +598,7 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             
-                            lora_A_output = lora_A(dropped_x)
+                            lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                             expert_output = lora_B(lora_A_output)
                             
                             masked_weights = torch.zeros_like(expert_weights)
@@ -572,7 +629,7 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                                 lora_A = getattr(self, f"lora_A{i}")
                                 lora_B = getattr(self, f"lora_B{i}")
                                 
-                                lora_A_output = lora_A(dropped_x)
+                                lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                                 expert_output = lora_B(lora_A_output)
                                 
                                 masked_weights = torch.zeros_like(expert_weights)
@@ -583,7 +640,7 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
-                            lora_A_output = lora_A(dropped_x)
+                            lora_A_output = self._apply_svd_lora(i, lora_A(dropped_x))
                             scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
                             lora_output = lora_B(lora_A_output)
                             current_result = current_result + scaled_route * lora_output * self.scaling
@@ -594,15 +651,14 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                 expected_dtype = result.dtype
                 if x.dtype != torch.float32:
                     x = x.float()
-                
+
                 result = process_with_routing(x, expected_dtype)
                 result = result.to(expected_dtype)
             else:
                 result = process_with_routing(x)
-        
+
         blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
         return result
-
 
 class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
     def __init__(
@@ -617,6 +673,7 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
         adaptive: bool = False,
         idx: int = 0,
         k: int = 0,
+        adapter_type: str = "lora",
         **kwargs,
     ):
         bnb.nn.Linear8bitLt.__init__(
@@ -629,7 +686,14 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
             threshold=kwargs.get("threshold", 0.0),
             index=kwargs.get("index", None),
         )
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
+        LoraLayer.__init__(
+            self,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=False,
+            adapter_type=adapter_type,
+        )
         
         if out_features % len(enable_lora) != 0:
             raise ValueError("The length of enable_lora must divide out_features")
@@ -655,6 +719,8 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                     groups=sum(enable_lora),
                     bias=False
                 ))
+                if self.adapter_type == "svd_lora":
+                    setattr(self, f"lora_svd_e{i}", nn.Parameter(torch.ones(r)))
             
             self.scaling = self.lora_alpha / self.r
             self.weight.requires_grad = False
@@ -670,6 +736,8 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                     nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
                 if hasattr(self, f"lora_B{i}"):
                     getattr(self, f"lora_B{i}").weight.data.zero_()
+                if hasattr(self, f"lora_svd_e{i}"):
+                    getattr(self, f"lora_svd_e{i}").data.fill_(1.0)
             if hasattr(self, "lora_route"):
                 nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
 
@@ -723,7 +791,7 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             
-                            after_A = lora_A(dropped_x).transpose(-2, -1)
+                            after_A = self._apply_svd_lora(i, lora_A(dropped_x)).transpose(-2, -1)
                             after_B = lora_B(after_A).transpose(-2, -1)
                             
                             if target_dtype is not None:
@@ -760,7 +828,7 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                                 lora_A = getattr(self, f"lora_A{i}")
                                 lora_B = getattr(self, f"lora_B{i}")
                                 
-                                after_A = lora_A(dropped_x).transpose(-2, -1)
+                                after_A = self._apply_svd_lora(i, lora_A(dropped_x)).transpose(-2, -1)
                                 after_B = lora_B(after_A).transpose(-2, -1)
                                 
                                 if target_dtype is not None:
@@ -776,7 +844,7 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
-                            after_A = lora_A(dropped_x).transpose(-2, -1)
+                            after_A = self._apply_svd_lora(i, lora_A(dropped_x)).transpose(-2, -1)
                             scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
                             after_B = lora_B(after_A).transpose(-2, -1)
                             
@@ -798,8 +866,6 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
                 result = result.to(expected_dtype)
             else:
                 result = process_with_routing(x)
-        
+
         blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
         return result
-    
-    

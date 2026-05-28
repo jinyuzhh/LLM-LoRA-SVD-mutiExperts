@@ -38,6 +38,36 @@ def average_rank_dropout_stats(stats_list):
     }
 
 
+def pruning_enabled_for_round(pruning_config, rank_dropout_config, assignment_type, round_idx, round_warmup):
+    if not pruning_config.get("enable_rank_pruning", False):
+        return False
+    if assignment_type != "hard_primary":
+        return False
+    if round_idx < round_warmup:
+        return False
+
+    if not rank_dropout_config.get("enable_rank_dropout", False):
+        return True
+
+    dropout_stop_round = rank_dropout_config.get("dropout_stop_round", -1)
+    return dropout_stop_round >= 0 and round_idx >= dropout_stop_round
+
+
+def log_pruning_stats(log_file, round_idx, stats):
+    message = (
+        f"Round {round_idx + 1} pruning stats: "
+        f"communication_before={stats.get('communication_before', 0)}, "
+        f"communication_after={stats.get('communication_after', 0)}, "
+        f"newly_pruned={stats.get('newly_pruned', 0)}"
+    )
+    print(message)
+    with open(log_file, "a") as f:
+        f.write(message + "\n")
+        f.write("Active rank count per expert/layer:\n")
+        for key, count in sorted(stats.get("active_rank_counts", {}).items()):
+            f.write(f"  {key}: {count}\n")
+
+
 def train_federated(
     dummy,
     clients,
@@ -53,8 +83,10 @@ def train_federated(
     batch_size=128,
     similarity_type="fedlease_original",
     assignment_type="fedlease_top_m",
-    assignment_margin_delta=0.0
+    assignment_margin_delta=0.0,
+    pruning_config=None
 ):
+    pruning_config = pruning_config or {}
     personal_dir = os.path.join(output_dir, "proposed_m2")
     os.makedirs(personal_dir, exist_ok=True)
     
@@ -65,6 +97,7 @@ def train_federated(
         f.write(f"Total Rounds: {global_rounds}, Local Epochs: {local_epochs}, Warmup Rounds: {round_warmup}\n")
         if clients:
             f.write(f"Rank Dropout Config: {clients[0].rank_dropout_config}\n")
+        f.write(f"Rank Pruning Config: {pruning_config}\n")
         f.write("-" * 50 + "\n")
     
     warmup_clients = clients
@@ -187,7 +220,8 @@ def train_federated(
                             adaptive=True,
                             cache_path=output_dir,
                             idx=client_cluster,
-                            rank_dropout_config=warmup_clients[client_id].rank_dropout_config
+                            rank_dropout_config=warmup_clients[client_id].rank_dropout_config,
+                            pruning_config=pruning_config
                         )
                         
                         client.set_dataset(client_datasets[client_id], num_labels)
@@ -196,7 +230,7 @@ def train_federated(
                     
                     clients = clustered_clients
                     
-                    server = Server(clients_num=len(clients))
+                    server = Server(clients_num=len(clients), pruning_config=pruning_config)
                     
                     with open(log_file, "a") as f:
                         f.write(f"Initialized {len(clients)} clustered clients with {optimal_n_clusters} LoRA modules\n")
@@ -270,10 +304,18 @@ def train_federated(
             
             client_params = []
             round_rank_dropout_stats = []
+            use_sparse_pruning_upload = pruning_config.get("enable_rank_pruning", False) and assignment_type == "hard_primary"
+            if use_sparse_pruning_upload and clients:
+                clients[0].load_model()
+                use_sparse_pruning_upload = clients[0].has_svd_lora_params()
+                clients[0].unload_model()
+
+            active_rank_masks = server.get_active_rank_masks() if hasattr(server, "get_active_rank_masks") else {}
             for client in tqdm(clients, desc="Client Training (Clustered)"):
                 with open(log_file, "a") as f:
                     f.write(f"Training Clustered Client {client.client_id} ({client.task_name})...\n")
                 
+                client.set_active_rank_masks(active_rank_masks)
                 client.load_model()
                 if round_idx > round_warmup:
                     client.load_params(aggregated_params[client.client_id])
@@ -288,8 +330,11 @@ def train_federated(
                 )
                 log_rank_dropout_stats(log_file, f"Clustered Client {client.client_id}", client_stats)
                 round_rank_dropout_stats.append(client_stats)
-                params = client.get_lora_params()
-                client_params.append(params['params'])
+                if use_sparse_pruning_upload:
+                    client_params.append(client.get_sparse_lora_params_for_pruning())
+                else:
+                    params = client.get_lora_params()
+                    client_params.append(params['params'])
                 
                 client.unload_model()
 
@@ -301,12 +346,28 @@ def train_federated(
             
             with open(log_file, "a") as f:
                 f.write("Starting Server Aggregation (Clustered)...\n")
+
+            if hasattr(server, "pruning_config"):
+                server.pruning_config["pruning_enabled_this_round"] = pruning_enabled_for_round(
+                    pruning_config,
+                    clients[0].rank_dropout_config if clients else {},
+                    assignment_type,
+                    round_idx,
+                    round_warmup
+                )
             
             aggregated_params = server.aggregation(
                 route_aggregation=True,
                 params=client_params,
                 lora_client_map=lora_client_map
             )
+
+            if use_sparse_pruning_upload and hasattr(server, "get_active_rank_masks"):
+                active_rank_masks = server.get_active_rank_masks()
+                for client in clients:
+                    client.set_active_rank_masks(active_rank_masks)
+                log_pruning_stats(log_file, round_idx, server.get_last_pruning_stats())
+                server.save_pruning_state(personal_dir, round_idx)
             
             if (round_idx + 1) % 1 == 0:
                 with open(log_file, "a") as f:
@@ -401,6 +462,14 @@ def parse_args():
                         help="Rank importance weight for LoRA B")
     parser.add_argument("--lambda_a", type=float, default=1.0,
                         help="Rank importance weight for LoRA A")
+    parser.add_argument("--enable_rank_pruning", action="store_true",
+                        help="Enable server-side expert-rank pruning for SVD-LoRA")
+    parser.add_argument("--pruning_threshold", type=float, default=0.0,
+                        help="EMA importance threshold for rank pruning")
+    parser.add_argument("--pruning_patience", type=int, default=1,
+                        help="Consecutive below-threshold rounds required before pruning")
+    parser.add_argument("--r_min", type=int, default=1,
+                        help="Minimum active ranks to keep per expert/layer")
     
     return parser.parse_args()
 
@@ -421,6 +490,12 @@ def main():
         "lambda_e": args.lambda_e,
         "lambda_b": args.lambda_b,
         "lambda_a": args.lambda_a,
+    }
+    pruning_config = {
+        "enable_rank_pruning": args.enable_rank_pruning,
+        "pruning_threshold": args.pruning_threshold,
+        "pruning_patience": args.pruning_patience,
+        "r_min": args.r_min,
     }
     
     print(f"Running federated learning with multi-task datasets: {task_name_list}")
@@ -450,7 +525,8 @@ def main():
         num_clients=client_num,
         rank=args.rank,
         cache_path=output_dir,
-        rank_dropout_config=rank_dropout_config
+        rank_dropout_config=rank_dropout_config,
+        pruning_config=pruning_config
     )
     dummy.set_dataset(client_datasets[0], dummy_num_labels)
     
@@ -467,12 +543,13 @@ def main():
             num_clients=client_num,
             rank=args.rank,
             cache_path=output_dir,
-            rank_dropout_config=rank_dropout_config
+            rank_dropout_config=rank_dropout_config,
+            pruning_config=pruning_config
         )
         client.set_dataset(client_datasets[client_id], num_labels)
         warmup_clients.append(client)
     
-    warmup_server = Server(clients_num=len(warmup_clients))
+    warmup_server = Server(clients_num=len(warmup_clients), pruning_config=pruning_config)
     
     train_result = train_federated(
         dummy=dummy,
@@ -489,7 +566,8 @@ def main():
         batch_size=args.batch_size,
         similarity_type=args.similarity_type,
         assignment_type=args.assignment_type,
-        assignment_margin_delta=args.assignment_margin_delta
+        assignment_margin_delta=args.assignment_margin_delta,
+        pruning_config=pruning_config
     )
     
     print("\nTraining completed!")

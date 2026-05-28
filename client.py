@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import json
 import numpy as np
@@ -25,7 +26,8 @@ class Client:
         adaptive=False,
         cache_path="./output",
         idx=None,
-        rank_dropout_config=None
+        rank_dropout_config=None,
+        pruning_config=None
     ):
         self.client_id = client_id
         self.task_name = task_name
@@ -42,6 +44,8 @@ class Client:
         self.num_labels = None
         self.idx = idx
         self.rank_dropout_config = rank_dropout_config or {}
+        self.pruning_config = pruning_config or {}
+        self.active_rank_masks = {}
         
     def set_dataset(self, dataset, num_labels):
         self.datasets = dataset
@@ -92,6 +96,167 @@ class Client:
             if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'lora_route' in name or 'classifier' in name:
                 lora_params['params'][name] = param.data.clone()
         return lora_params
+
+    def set_active_rank_masks(self, active_rank_masks):
+        self.active_rank_masks = active_rank_masks or {}
+
+    def has_svd_lora_params(self):
+        return any("lora_svd_e" in name for name, _ in self.local_model.named_parameters())
+
+    @staticmethod
+    def _parse_rank_param_name(name):
+        match = re.match(r"^(.*)\.lora_A(\d+)\.weight$", name)
+        if match:
+            return match.group(1), int(match.group(2)), "A"
+
+        match = re.match(r"^(.*)\.lora_B(\d+)\.weight$", name)
+        if match:
+            return match.group(1), int(match.group(2)), "B"
+
+        match = re.match(r"^(.*)\.lora_svd_e(\d+)$", name)
+        if match:
+            return match.group(1), int(match.group(2)), "e"
+
+        return None
+
+    @staticmethod
+    def _mask_key(layer_name, expert_id):
+        return f"{layer_name}||{expert_id}"
+
+    def _rank_is_active(self, layer_name, expert_id, rank_id):
+        mask = self.active_rank_masks.get(self._mask_key(layer_name, expert_id))
+        if mask is None:
+            return True
+        return rank_id < len(mask) and bool(mask[rank_id])
+
+    def _compute_group_rank_importance(self, group):
+        A = group.get("A")
+        B = group.get("B")
+        e = group.get("e")
+
+        if A is None or B is None or e is None:
+            return None
+
+        A = A.float()
+        B = B.float()
+        e = e.float()
+        rank = min(A.shape[0], B.shape[-1], e.shape[0])
+
+        lambda_e = self.rank_dropout_config.get("lambda_e", 1.0)
+        lambda_b = self.rank_dropout_config.get("lambda_b", 1.0)
+        lambda_a = self.rank_dropout_config.get("lambda_a", 1.0)
+
+        importance = (
+            lambda_e * torch.abs(e[:rank])
+            + lambda_b * torch.mean(torch.abs(B[:, :rank]), dim=0)
+            + lambda_a * torch.mean(torch.abs(A[:rank, :]), dim=1)
+        )
+        return (importance - torch.min(importance)) / (torch.max(importance) - torch.min(importance) + 1e-8)
+
+    def get_sparse_lora_params_for_pruning(self):
+        dense_params = {}
+        grouped_params = {}
+        communication_before = 0
+        communication_after = 0
+
+        for name, param in self.local_model.named_parameters():
+            include_param = (
+                'lora_A' in name
+                or 'lora_B' in name
+                or 'lora_svd_e' in name
+                or 'lora_route' in name
+                or 'classifier' in name
+            )
+            if not include_param:
+                continue
+
+            parsed = self._parse_rank_param_name(name)
+            if parsed is None:
+                dense_params[name] = param.data.clone()
+                communication_before += param.numel()
+                communication_after += param.numel()
+                continue
+
+            layer_name, expert_id, part = parsed
+            if self.idx is not None and expert_id != int(self.idx):
+                continue
+
+            group_key = (layer_name, expert_id)
+            if group_key not in grouped_params:
+                grouped_params[group_key] = {"names": {}, "A": None, "B": None, "e": None}
+
+            grouped_params[group_key]["names"][part] = name
+            grouped_params[group_key][part] = param.data.detach().clone()
+            communication_before += param.numel()
+
+        rank_updates = []
+        rank_importance = []
+
+        for (layer_name, expert_id), group in grouped_params.items():
+            importance = self._compute_group_rank_importance(group)
+            A = group.get("A")
+            B = group.get("B")
+            e = group.get("e")
+
+            if A is None or B is None or e is None:
+                for part, tensor in (("A", A), ("B", B), ("e", e)):
+                    if tensor is not None:
+                        name = group["names"][part]
+                        dense_params[name] = tensor.clone()
+                        communication_after += tensor.numel()
+                continue
+
+            rank = min(A.shape[0], B.shape[-1], e.shape[0])
+            for rank_id in range(rank):
+                if not self._rank_is_active(layer_name, expert_id, rank_id):
+                    continue
+
+                if importance is not None:
+                    rank_importance.append({
+                        "layer": layer_name,
+                        "expert_id": expert_id,
+                        "rank_id": rank_id,
+                        "value": float(importance[rank_id].cpu()),
+                    })
+
+                rank_updates.append({
+                    "layer": layer_name,
+                    "expert_id": expert_id,
+                    "rank_id": rank_id,
+                    "part": "A",
+                    "param_name": group["names"]["A"],
+                    "value": A[rank_id, :].clone(),
+                    "full_shape": tuple(A.shape),
+                })
+                rank_updates.append({
+                    "layer": layer_name,
+                    "expert_id": expert_id,
+                    "rank_id": rank_id,
+                    "part": "B",
+                    "param_name": group["names"]["B"],
+                    "value": B[:, rank_id].clone(),
+                    "full_shape": tuple(B.shape),
+                })
+                rank_updates.append({
+                    "layer": layer_name,
+                    "expert_id": expert_id,
+                    "rank_id": rank_id,
+                    "part": "e",
+                    "param_name": group["names"]["e"],
+                    "value": e[rank_id].clone(),
+                    "full_shape": tuple(e.shape),
+                })
+                communication_after += A.shape[1] + B.shape[0] + 1
+
+        return {
+            "__sparse_rank_payload__": True,
+            "client_id": self.client_id,
+            "dense_params": dense_params,
+            "rank_updates": rank_updates,
+            "rank_importance": rank_importance,
+            "communication_before": communication_before,
+            "communication_after": communication_after,
+        }
     
     def get_lora_params_and_save_by_module(self, round_id, personal_dir):
         lora_params = {
@@ -300,7 +465,18 @@ class Client:
 
 
 class WarmupClient(Client):
-    def __init__(self, client_id, task_name, tokenizer, model_name, num_clients, rank=8, cache_path="./output", rank_dropout_config=None):
+    def __init__(
+        self,
+        client_id,
+        task_name,
+        tokenizer,
+        model_name,
+        num_clients,
+        rank=8,
+        cache_path="./output",
+        rank_dropout_config=None,
+        pruning_config=None
+    ):
         
         super().__init__(
             client_id,
@@ -312,7 +488,8 @@ class WarmupClient(Client):
             lora_n=1,
             adaptive=False,
             cache_path=cache_path,
-            rank_dropout_config=rank_dropout_config
+            rank_dropout_config=rank_dropout_config,
+            pruning_config=pruning_config
         )
         
     def load_model(self):

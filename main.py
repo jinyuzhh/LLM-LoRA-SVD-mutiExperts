@@ -26,7 +26,8 @@ def train_federated(
     max_clusters=10,
     task_info=None,
     client_datasets=None,
-    batch_size=128
+    batch_size=128,
+    similarity_type="fedlease_original"
 ):
     personal_dir = os.path.join(output_dir, "proposed_m2")
     os.makedirs(personal_dir, exist_ok=True)
@@ -97,7 +98,8 @@ def train_federated(
                     warmup_clients, 
                     round_idx, 
                     personal_dir,
-                    max_clusters=max_clusters
+                    max_clusters=max_clusters,
+                    similarity_type=similarity_type
                 )
                 agg_lora_client_map = lora_client_map
                 
@@ -303,6 +305,9 @@ def parse_args():
                         help="Training batch size")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--similarity_type", type=str, default="fedlease_original",
+                        choices=["fedlease_original", "svd_b_e"],
+                        help="Client similarity backend for clustering")
     
     return parser.parse_args()
 
@@ -376,7 +381,8 @@ def main():
         max_clusters=args.max_clusters,
         task_info=task_info,
         client_datasets=client_datasets,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        similarity_type=args.similarity_type
     )
     
     print("\nTraining completed!")

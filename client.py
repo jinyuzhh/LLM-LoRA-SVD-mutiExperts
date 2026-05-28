@@ -74,7 +74,7 @@ class Client:
             'params': {}
         }
         for name, param in self.local_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name or 'lora_route' in name or 'classifier' in name:
+            if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'lora_route' in name or 'classifier' in name:
                 lora_params['params'][name] = param.data.clone()
         return lora_params
     
@@ -87,9 +87,10 @@ class Client:
         target_modules = ["query", "value"]
         lora_A_dict = {module: [] for module in target_modules}
         lora_B_dict = {module: [] for module in target_modules}
+        lora_svd_e_dict = {module: [] for module in target_modules}
 
         for name, param in self.local_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name or 'lora_route' in name or 'classifier' in name:
+            if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'lora_route' in name or 'classifier' in name:
                 lora_params['params'][name] = param.data.clone()
 
             for module in target_modules:
@@ -98,6 +99,8 @@ class Client:
                         lora_A_dict[module].append(param.data.clone().cpu().numpy())
                     elif 'lora_B0' in name:
                         lora_B_dict[module].append(param.data.clone().cpu().numpy())
+                    elif 'lora_svd_e0' in name:
+                        lora_svd_e_dict[module].append(param.data.clone().cpu().numpy())
 
         param_dir = os.path.join(personal_dir, "lora_params")
         os.makedirs(param_dir, exist_ok=True)
@@ -107,6 +110,8 @@ class Client:
                 np.save(os.path.join(param_dir, f'{module}_lora_A_client_{self.client_id}_{round_id}.npy'), np.array(lora_A_dict[module]))
             if lora_B_dict[module]:  
                 np.save(os.path.join(param_dir, f'{module}_lora_B_client_{self.client_id}_{round_id}.npy'), np.array(lora_B_dict[module]))
+            if lora_svd_e_dict[module]:
+                np.save(os.path.join(param_dir, f'{module}_lora_svd_e_client_{self.client_id}_{round_id}.npy'), np.array(lora_svd_e_dict[module]))
 
         return lora_params
     
@@ -135,7 +140,7 @@ class Client:
             print(f"Training all LoRA modules for client {self.client_id}")
 
             for name, param in self.local_model.named_parameters():
-                if 'lora_A' in name or 'lora_B' in name or 'lora_route' in name:
+                if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'lora_route' in name:
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -145,7 +150,9 @@ class Client:
                 lora_a_pattern = f'lora_A{client_lora_group}'
                 lora_b_pattern = f'lora_B{client_lora_group}'
 
-                if lora_a_pattern in name or lora_b_pattern in name or 'lora_route' in name:
+                lora_svd_e_pattern = f'lora_svd_e{client_lora_group}'
+
+                if lora_a_pattern in name or lora_b_pattern in name or lora_svd_e_pattern in name or 'lora_route' in name:
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -260,7 +267,7 @@ class WarmupClient(Client):
         self.local_model.train()
 
         for name, param in self.local_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name:
+            if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -304,7 +311,7 @@ class WarmupClient(Client):
             'params': {}
         }
         for name, param in self.local_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name or 'classifier' in name:
+            if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'classifier' in name:
                 lora_params['params'][name] = param.data.clone()
         return lora_params
     
@@ -317,9 +324,10 @@ class WarmupClient(Client):
         target_modules = ["query", "value"]
         lora_A_dict = {module: [] for module in target_modules}
         lora_B_dict = {module: [] for module in target_modules}
+        lora_svd_e_dict = {module: [] for module in target_modules}
 
         for name, param in self.local_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name or 'lora_route' in name or 'classifier' in name:
+            if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name or 'lora_route' in name or 'classifier' in name:
                 lora_params['params'][name] = param.data.clone()
 
             for module in target_modules:
@@ -328,6 +336,8 @@ class WarmupClient(Client):
                         lora_A_dict[module].append(param.data.clone().cpu().numpy())
                     elif 'lora_B0' in name:
                         lora_B_dict[module].append(param.data.clone().cpu().numpy())
+                    elif 'lora_svd_e0' in name:
+                        lora_svd_e_dict[module].append(param.data.clone().cpu().numpy())
 
         param_dir = os.path.join(personal_dir, "lora_params")
         print(param_dir)
@@ -338,6 +348,8 @@ class WarmupClient(Client):
                 np.save(os.path.join(param_dir, f'{module}_lora_A_client_{self.client_id}_{round_id}.npy'), np.array(lora_A_dict[module]))
             if lora_B_dict[module]: 
                 np.save(os.path.join(param_dir, f'{module}_lora_B_client_{self.client_id}_{round_id}.npy'), np.array(lora_B_dict[module]))
+            if lora_svd_e_dict[module]:
+                np.save(os.path.join(param_dir, f'{module}_lora_svd_e_client_{self.client_id}_{round_id}.npy'), np.array(lora_svd_e_dict[module]))
 
         return lora_params
 

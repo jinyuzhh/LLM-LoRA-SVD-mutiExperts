@@ -467,6 +467,115 @@ def calculate_B_similarity_matrix(client_ids, proj_type, round_id, base_dir="./"
     return distance_matrix_B
 
 
+def load_svd_lora_adapter(proj_type, client_id, round_id, base_dir="./"):
+    B = load_B_only(proj_type, client_id, round_id, base_dir)
+    e_path = os.path.join(base_dir, f"{proj_type}_lora_svd_e_client_{client_id}_{round_id}.npy")
+
+    if os.path.exists(e_path):
+        e = np.load(e_path).astype(np.float32)
+    else:
+        e = np.ones((B.shape[0], B.shape[-1]), dtype=np.float32)
+
+    if e.ndim == 1:
+        e = np.broadcast_to(e, (B.shape[0], e.shape[0])).astype(np.float32)
+    elif e.shape[0] == 1 and B.shape[0] > 1:
+        e = np.broadcast_to(e, (B.shape[0], e.shape[-1])).astype(np.float32)
+
+    gc.collect()
+    return {"B": B, "e": e}
+
+
+def compute_svd_lora_similarity(client_adapter_a, client_adapter_b, eps=1e-8):
+    B_a = np.asarray(client_adapter_a["B"], dtype=np.float32)
+    B_b = np.asarray(client_adapter_b["B"], dtype=np.float32)
+    e_a = np.asarray(client_adapter_a["e"], dtype=np.float32)
+    e_b = np.asarray(client_adapter_b["e"], dtype=np.float32)
+
+    if B_a.ndim == 2:
+        B_a = B_a[np.newaxis, ...]
+    if B_b.ndim == 2:
+        B_b = B_b[np.newaxis, ...]
+    if e_a.ndim == 1:
+        e_a = e_a[np.newaxis, ...]
+    if e_b.ndim == 1:
+        e_b = e_b[np.newaxis, ...]
+
+    n_layers = min(B_a.shape[0], B_b.shape[0], e_a.shape[0], e_b.shape[0])
+    similarities = []
+
+    for layer in range(n_layers):
+        b_a = B_a[layer]
+        b_b = B_b[layer]
+        rank = min(b_a.shape[-1], b_b.shape[-1], e_a[layer].shape[-1], e_b[layer].shape[-1])
+
+        if rank == 0:
+            continue
+
+        b_a_tilde = b_a[:, :rank] * np.abs(e_a[layer][:rank])
+        b_b_tilde = b_b[:, :rank] * np.abs(e_b[layer][:rank])
+
+        numerator = np.sum(b_a_tilde * b_b_tilde)
+        denom_a = np.sum(b_a_tilde ** 2)
+        denom_b = np.sum(b_b_tilde ** 2)
+        similarity = numerator / (np.sqrt(denom_a) * np.sqrt(denom_b) + eps)
+        similarities.append(float(similarity))
+
+    if not similarities:
+        return 0.0
+
+    return float(np.mean(similarities))
+
+
+def calculate_svd_lora_similarity_matrix(client_ids, proj_type, round_id, base_dir="./"):
+    n_clients = len(client_ids)
+    distance_matrix = np.zeros((n_clients, n_clients), dtype=np.float32)
+    client_pairs = [(i, j) for i in range(n_clients) for j in range(i + 1, n_clients)]
+
+    adapter_cache = {}
+
+    for (i, j) in tqdm(client_pairs, desc=f"Computing {proj_type} SVD-LoRA B/e similarities"):
+        client_i = client_ids[i]
+        client_j = client_ids[j]
+
+        try:
+            if client_i not in adapter_cache:
+                adapter_cache[client_i] = load_svd_lora_adapter(proj_type, client_i, round_id, base_dir)
+            if client_j not in adapter_cache:
+                adapter_cache[client_j] = load_svd_lora_adapter(proj_type, client_j, round_id, base_dir)
+        except FileNotFoundError as e:
+            print(f"Error loading SVD-LoRA adapter matrices: {e}")
+            print(f"Skipping client pair ({client_i}, {client_j})")
+            continue
+
+        similarity = compute_svd_lora_similarity(adapter_cache[client_i], adapter_cache[client_j])
+        distance_matrix[i, j] = distance_matrix[j, i] = 1 - similarity
+
+    gc.collect()
+    return distance_matrix
+
+
+def log_similarity_matrix_stats(matrix, label, log_file=None):
+    matrix = np.asarray(matrix)
+    similarity_matrix = 1 - matrix
+
+    if similarity_matrix.shape[0] > 1:
+        mask = ~np.eye(similarity_matrix.shape[0], dtype=bool)
+        values = similarity_matrix[mask]
+    else:
+        values = similarity_matrix.reshape(-1)
+
+    stats_msg = (
+        f"{label} similarity matrix stats: "
+        f"mean={np.mean(values):.6f}, std={np.std(values):.6f}, "
+        f"min={np.min(values):.6f}, max={np.max(values):.6f}"
+    )
+    print(stats_msg)
+
+    if log_file is not None:
+        with open(log_file, "a") as f:
+            f.write(stats_msg + "\n")
+
+
 def visualize_clustering(combined_matrix, client_ids, labels, output_dir, round_idx):
     os.makedirs(output_dir, exist_ok=True)
     
@@ -500,8 +609,11 @@ def visualize_clustering(combined_matrix, client_ids, labels, output_dir, round_
     plt.close()
 
 
-def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=10):
-    print("Computing LoRA client map based on B matrix similarity...")
+def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=10, similarity_type="fedlease_original"):
+    if similarity_type not in {"fedlease_original", "svd_b_e"}:
+        raise ValueError("similarity_type must be either 'fedlease_original' or 'svd_b_e'")
+
+    print(f"Computing LoRA client map using similarity_type={similarity_type}...")
     
     from sklearn.metrics import silhouette_score, davies_bouldin_score
     
@@ -513,6 +625,7 @@ def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=
     log_file = os.path.join(personal_dir, "training_log.txt")
     with open(log_file, "a") as f:
         f.write("\nStarting LoRA client mapping calculation...\n")
+        f.write(f"Similarity type: {similarity_type}\n")
     
     all_distance_matrices = {}
     
@@ -520,11 +633,15 @@ def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=
     
     for proj_type in proj_types:
         with open(log_file, "a") as f:
-            f.write(f"Calculating {proj_type} B matrix similarities...\n")
+            f.write(f"Calculating {proj_type} similarities with backend {similarity_type}...\n")
         
         print(param_dir)
-        dist_matrix_B = calculate_B_similarity_matrix(client_ids, proj_type, round_idx, base_dir=param_dir)
+        if similarity_type == "fedlease_original":
+            dist_matrix_B = calculate_B_similarity_matrix(client_ids, proj_type, round_idx, base_dir=param_dir)
+        else:
+            dist_matrix_B = calculate_svd_lora_similarity_matrix(client_ids, proj_type, round_idx, base_dir=param_dir)
         all_distance_matrices[proj_type] = dist_matrix_B
+        log_similarity_matrix_stats(dist_matrix_B, proj_type, log_file)
         
         np.save(os.path.join(personal_dir, f"{proj_type}_distance_matrix_round_{round_idx}.npy"), dist_matrix_B)
     
@@ -535,6 +652,7 @@ def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=
     for proj_type in proj_types:
         combined_matrix += all_distance_matrices[proj_type]
     combined_matrix /= len(proj_types)
+    log_similarity_matrix_stats(combined_matrix, "combined", log_file)
     
     np.save(os.path.join(personal_dir, f"combined_distance_matrix_round_{round_idx}.npy"), combined_matrix)
     

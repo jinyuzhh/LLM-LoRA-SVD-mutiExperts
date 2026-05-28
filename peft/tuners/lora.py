@@ -82,6 +82,14 @@ class LoraConfig(PeftConfig):
         default="lora",
         metadata={"help": "Adapter type. Supported values: 'lora' and 'svd_lora'."},
     )
+    enable_rank_dropout: bool = field(default=False, metadata={"help": "Enable SVD-LoRA rank-wise dropout"})
+    p_base: float = field(default=0.0, metadata={"help": "Base probability for rank-wise dropout"})
+    dropout_warmup_rounds: int = field(default=0, metadata={"help": "Global rounds before rank dropout starts"})
+    dropout_ramp_rounds: int = field(default=0, metadata={"help": "Global rounds used to ramp rank dropout gamma"})
+    dropout_stop_round: int = field(default=-1, metadata={"help": "Global round at which rank dropout is disabled"})
+    lambda_e: float = field(default=1.0, metadata={"help": "Rank importance weight for SVD e"})
+    lambda_b: float = field(default=1.0, metadata={"help": "Rank importance weight for LoRA B"})
+    lambda_a: float = field(default=1.0, metadata={"help": "Rank importance weight for LoRA A"})
 
     def __post_init__(self):
         if self.adapter_type not in {"lora", "svd_lora"}:
@@ -124,6 +132,14 @@ class LoraModel(torch.nn.Module):
             "idx": self.peft_config.idx,
             "k": self.peft_config.k,
             "adapter_type": self.peft_config.adapter_type,
+            "enable_rank_dropout": self.peft_config.enable_rank_dropout,
+            "p_base": self.peft_config.p_base,
+            "dropout_warmup_rounds": self.peft_config.dropout_warmup_rounds,
+            "dropout_ramp_rounds": self.peft_config.dropout_ramp_rounds,
+            "dropout_stop_round": self.peft_config.dropout_stop_round,
+            "lambda_e": self.peft_config.lambda_e,
+            "lambda_b": self.peft_config.lambda_b,
+            "lambda_a": self.peft_config.lambda_a,
         }
 
         key_list = [key for key, _ in self.model.named_modules()]
@@ -201,6 +217,14 @@ class LoraModel(torch.nn.Module):
                         idx=self.peft_config.idx,
                         k=self.peft_config.k,
                         adapter_type=self.peft_config.adapter_type,
+                        enable_rank_dropout=self.peft_config.enable_rank_dropout,
+                        p_base=self.peft_config.p_base,
+                        dropout_warmup_rounds=self.peft_config.dropout_warmup_rounds,
+                        dropout_ramp_rounds=self.peft_config.dropout_ramp_rounds,
+                        dropout_stop_round=self.peft_config.dropout_stop_round,
+                        lambda_e=self.peft_config.lambda_e,
+                        lambda_b=self.peft_config.lambda_b,
+                        lambda_a=self.peft_config.lambda_a,
                     )
 
                 self._replace_module(parent, target_name, new_module, target)
@@ -251,6 +275,14 @@ class LoraLayer:
         lora_dropout: float,
         merge_weights: bool,
         adapter_type: str = "lora",
+        enable_rank_dropout: bool = False,
+        p_base: float = 0.0,
+        dropout_warmup_rounds: int = 0,
+        dropout_ramp_rounds: int = 0,
+        dropout_stop_round: int = -1,
+        lambda_e: float = 1.0,
+        lambda_b: float = 1.0,
+        lambda_a: float = 1.0,
     ):
         self.r = r
         self.lora_alpha = lora_alpha
@@ -264,6 +296,87 @@ class LoraLayer:
         self.merged = False
         self.merge_weights = merge_weights
         self.disable_adapters = False
+        self.enable_rank_dropout = enable_rank_dropout
+        self.p_base = p_base
+        self.dropout_warmup_rounds = dropout_warmup_rounds
+        self.dropout_ramp_rounds = dropout_ramp_rounds
+        self.dropout_stop_round = dropout_stop_round
+        self.lambda_e = lambda_e
+        self.lambda_b = lambda_b
+        self.lambda_a = lambda_a
+        self.rank_dropout_gamma = 0.0
+        self.last_rank_dropout_rate = None
+        self.last_rank_importance = None
+
+    def set_rank_dropout_gamma(self, gamma: float):
+        self.rank_dropout_gamma = float(gamma)
+
+    def get_rank_dropout_stats(self):
+        if self.last_rank_dropout_rate is None or self.last_rank_importance is None:
+            return None
+        return {
+            "dropout_rate": float(self.last_rank_dropout_rate),
+            "rank_importance": float(self.last_rank_importance),
+        }
+
+    def _reset_rank_dropout_stats(self):
+        self.last_rank_dropout_rate = None
+        self.last_rank_importance = None
+
+    def _rank_importance(self, expert_idx: int) -> torch.Tensor:
+        lora_A = getattr(self, f"lora_A{expert_idx}")
+        lora_B = getattr(self, f"lora_B{expert_idx}")
+        svd_e = getattr(self, f"lora_svd_e{expert_idx}")
+
+        e_score = torch.abs(svd_e)
+
+        b_weight = lora_B.weight
+        if b_weight.dim() == 3:
+            b_weight = b_weight.squeeze(-1)
+        b_score = torch.mean(torch.abs(b_weight), dim=0)
+
+        a_weight = lora_A.weight
+        a_score = torch.mean(torch.abs(a_weight), dim=1)
+
+        if b_score.shape[0] != e_score.shape[0]:
+            b_score = b_score.reshape(-1, e_score.shape[0]).mean(dim=0)
+        if a_score.shape[0] != e_score.shape[0]:
+            a_score = a_score.reshape(-1, e_score.shape[0]).mean(dim=0)
+
+        importance = self.lambda_e * e_score + self.lambda_b * b_score + self.lambda_a * a_score
+        min_importance = torch.min(importance)
+        max_importance = torch.max(importance)
+        return (importance - min_importance) / (max_importance - min_importance + 1e-8)
+
+    def _apply_rank_dropout(self, expert_idx: int, hidden: torch.Tensor) -> torch.Tensor:
+        if (
+            self.adapter_type != "svd_lora"
+            or not self.enable_rank_dropout
+            or not self.training
+            or self.rank_dropout_gamma <= 0
+            or self.p_base <= 0
+        ):
+            self._reset_rank_dropout_stats()
+            return hidden
+
+        rank_importance = self._rank_importance(expert_idx).to(dtype=hidden.dtype, device=hidden.device)
+        dropout_prob = torch.clamp(self.p_base * (1 - rank_importance) * self.rank_dropout_gamma, min=0.0, max=1.0)
+        keep_prob = torch.clamp(1 - dropout_prob, min=1e-8)
+        mask = torch.bernoulli(keep_prob).to(dtype=hidden.dtype, device=hidden.device)
+        scaled_mask = mask / keep_prob
+
+        if hidden.shape[-1] == scaled_mask.shape[0]:
+            rank_mask = scaled_mask
+        elif hidden.shape[-1] % scaled_mask.shape[0] == 0:
+            rank_mask = scaled_mask.repeat(hidden.shape[-1] // scaled_mask.shape[0])
+        else:
+            raise ValueError(
+                f"Rank dropout mask shape {tuple(scaled_mask.shape)} is incompatible with hidden shape {tuple(hidden.shape)}"
+            )
+
+        self.last_rank_dropout_rate = float(torch.mean(dropout_prob.detach()).cpu())
+        self.last_rank_importance = float(torch.mean(rank_importance.detach()).cpu())
+        return hidden * rank_mask
 
     def _apply_svd_lora(self, expert_idx: int, hidden: torch.Tensor) -> torch.Tensor:
         if self.adapter_type != "svd_lora":
@@ -271,11 +384,11 @@ class LoraLayer:
 
         svd_e = getattr(self, f"lora_svd_e{expert_idx}").to(dtype=hidden.dtype, device=hidden.device)
         if hidden.shape[-1] == svd_e.shape[0]:
-            return hidden * svd_e
+            return self._apply_rank_dropout(expert_idx, hidden * svd_e)
 
         if hidden.shape[-1] % svd_e.shape[0] == 0:
             repeat = hidden.shape[-1] // svd_e.shape[0]
-            return hidden * svd_e.repeat(repeat)
+            return self._apply_rank_dropout(expert_idx, hidden * svd_e.repeat(repeat))
 
         raise ValueError(
             f"SVD-LoRA rank vector shape {tuple(svd_e.shape)} is incompatible with hidden shape {tuple(hidden.shape)}"
@@ -298,6 +411,14 @@ class Linear(nn.Linear, LoraLayer):
         idx: int = 0,
         k: int = 0,
         adapter_type: str = "lora",
+        enable_rank_dropout: bool = False,
+        p_base: float = 0.0,
+        dropout_warmup_rounds: int = 0,
+        dropout_ramp_rounds: int = 0,
+        dropout_stop_round: int = -1,
+        lambda_e: float = 1.0,
+        lambda_b: float = 1.0,
+        lambda_a: float = 1.0,
         **kwargs,
     ):
         self.r = r  
@@ -317,6 +438,14 @@ class Linear(nn.Linear, LoraLayer):
             lora_dropout=lora_dropout,
             merge_weights=merge_weights,
             adapter_type=adapter_type,
+            enable_rank_dropout=enable_rank_dropout,
+            p_base=p_base,
+            dropout_warmup_rounds=dropout_warmup_rounds,
+            dropout_ramp_rounds=dropout_ramp_rounds,
+            dropout_stop_round=dropout_stop_round,
+            lambda_e=lambda_e,
+            lambda_b=lambda_b,
+            lambda_a=lambda_a,
         )
         
         if r > 0:
@@ -501,6 +630,14 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
         idx: int = 0,
         k: int = 0,
         adapter_type: str = "lora",
+        enable_rank_dropout: bool = False,
+        p_base: float = 0.0,
+        dropout_warmup_rounds: int = 0,
+        dropout_ramp_rounds: int = 0,
+        dropout_stop_round: int = -1,
+        lambda_e: float = 1.0,
+        lambda_b: float = 1.0,
+        lambda_a: float = 1.0,
         **kwargs,
     ):
         bnb.nn.Linear8bitLt.__init__(
@@ -520,6 +657,14 @@ class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
             lora_dropout=lora_dropout,
             merge_weights=False,
             adapter_type=adapter_type,
+            enable_rank_dropout=enable_rank_dropout,
+            p_base=p_base,
+            dropout_warmup_rounds=dropout_warmup_rounds,
+            dropout_ramp_rounds=dropout_ramp_rounds,
+            dropout_stop_round=dropout_stop_round,
+            lambda_e=lambda_e,
+            lambda_b=lambda_b,
+            lambda_a=lambda_a,
         )
         
         self.lora_num = lora_nums
@@ -674,6 +819,14 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
         idx: int = 0,
         k: int = 0,
         adapter_type: str = "lora",
+        enable_rank_dropout: bool = False,
+        p_base: float = 0.0,
+        dropout_warmup_rounds: int = 0,
+        dropout_ramp_rounds: int = 0,
+        dropout_stop_round: int = -1,
+        lambda_e: float = 1.0,
+        lambda_b: float = 1.0,
+        lambda_a: float = 1.0,
         **kwargs,
     ):
         bnb.nn.Linear8bitLt.__init__(
@@ -693,6 +846,14 @@ class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
             lora_dropout=lora_dropout,
             merge_weights=False,
             adapter_type=adapter_type,
+            enable_rank_dropout=enable_rank_dropout,
+            p_base=p_base,
+            dropout_warmup_rounds=dropout_warmup_rounds,
+            dropout_ramp_rounds=dropout_ramp_rounds,
+            dropout_stop_round=dropout_stop_round,
+            lambda_e=lambda_e,
+            lambda_b=lambda_b,
+            lambda_a=lambda_a,
         )
         
         if out_features % len(enable_lora) != 0:

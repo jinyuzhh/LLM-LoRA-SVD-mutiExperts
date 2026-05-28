@@ -14,6 +14,30 @@ from client import Client, WarmupClient
 from server import Server
 
 
+def log_rank_dropout_stats(log_file, label, stats):
+    if stats is None:
+        message = f"{label} rank dropout stats: unavailable"
+    else:
+        message = (
+            f"{label} rank dropout stats: "
+            f"avg_dropout_rate={stats['dropout_rate']:.6f}, "
+            f"avg_rank_importance={stats['rank_importance']:.6f}"
+        )
+    print(message)
+    with open(log_file, "a") as f:
+        f.write(message + "\n")
+
+
+def average_rank_dropout_stats(stats_list):
+    valid_stats = [stats for stats in stats_list if stats is not None]
+    if not valid_stats:
+        return None
+    return {
+        "dropout_rate": sum(stats["dropout_rate"] for stats in valid_stats) / len(valid_stats),
+        "rank_importance": sum(stats["rank_importance"] for stats in valid_stats) / len(valid_stats),
+    }
+
+
 def train_federated(
     dummy,
     clients,
@@ -39,6 +63,8 @@ def train_federated(
     with open(log_file, "w") as f:
         f.write(f"[{current_time}] Starting Federated Training with Dummy Client\n")
         f.write(f"Total Rounds: {global_rounds}, Local Epochs: {local_epochs}, Warmup Rounds: {round_warmup}\n")
+        if clients:
+            f.write(f"Rank Dropout Config: {clients[0].rank_dropout_config}\n")
         f.write("-" * 50 + "\n")
     
     warmup_clients = clients
@@ -65,7 +91,16 @@ def train_federated(
                 f.write("Starting dummy client warmup\n")
             
             dummy.load_model()
-            dummy.local_training(lr=lr, epochs=local_epochs, batch_size=batch_size)
+            round_rank_dropout_stats = []
+            dummy_stats = dummy.local_training(
+                lr=lr,
+                epochs=local_epochs,
+                batch_size=batch_size,
+                current_round=round_idx,
+                is_warmup=True
+            )
+            log_rank_dropout_stats(log_file, f"Dummy Client {dummy.client_id}", dummy_stats)
+            round_rank_dropout_stats.append(dummy_stats)
             dummy.unload_model()
             
             client_params = []
@@ -77,7 +112,15 @@ def train_federated(
                 if round_idx > 0 and aggregated_params is not None:
                     client.load_params(aggregated_params[client.client_id])
                 
-                client.local_training(lr=lr, epochs=local_epochs, batch_size=batch_size)
+                client_stats = client.local_training(
+                    lr=lr,
+                    epochs=local_epochs,
+                    batch_size=batch_size,
+                    current_round=round_idx,
+                    is_warmup=True
+                )
+                log_rank_dropout_stats(log_file, f"Warmup Client {client.client_id}", client_stats)
+                round_rank_dropout_stats.append(client_stats)
                 params = client.get_lora_params_and_save_by_module(round_id=round_idx, personal_dir=personal_dir)
                 client_params.append(params['params'])
                 
@@ -87,6 +130,12 @@ def train_federated(
                     saved_params[client.client_id] = params['params']
                 
                 client.unload_model()
+
+            log_rank_dropout_stats(
+                log_file,
+                f"Round {round_idx + 1} average",
+                average_rank_dropout_stats(round_rank_dropout_stats)
+            )
             
             with open(log_file, "a") as f:
                 f.write("Starting Server Aggregation (Warmup)...\n")
@@ -137,7 +186,8 @@ def train_federated(
                             lora_n=optimal_n_clusters,
                             adaptive=True,
                             cache_path=output_dir,
-                            idx=client_cluster
+                            idx=client_cluster,
+                            rank_dropout_config=warmup_clients[client_id].rank_dropout_config
                         )
                         
                         client.set_dataset(client_datasets[client_id], num_labels)
@@ -219,6 +269,7 @@ def train_federated(
                     client.unload_model()
             
             client_params = []
+            round_rank_dropout_stats = []
             for client in tqdm(clients, desc="Client Training (Clustered)"):
                 with open(log_file, "a") as f:
                     f.write(f"Training Clustered Client {client.client_id} ({client.task_name})...\n")
@@ -227,12 +278,26 @@ def train_federated(
                 if round_idx > round_warmup:
                     client.load_params(aggregated_params[client.client_id])
                 
-                client.local_training(lr=lr, epochs=local_epochs, batch_size=batch_size, 
-                                     lora_client_map=lora_client_map)
+                client_stats = client.local_training(
+                    lr=lr,
+                    epochs=local_epochs,
+                    batch_size=batch_size,
+                    lora_client_map=lora_client_map,
+                    current_round=round_idx,
+                    is_warmup=False
+                )
+                log_rank_dropout_stats(log_file, f"Clustered Client {client.client_id}", client_stats)
+                round_rank_dropout_stats.append(client_stats)
                 params = client.get_lora_params()
                 client_params.append(params['params'])
                 
                 client.unload_model()
+
+            log_rank_dropout_stats(
+                log_file,
+                f"Round {round_idx + 1} average",
+                average_rank_dropout_stats(round_rank_dropout_stats)
+            )
             
             with open(log_file, "a") as f:
                 f.write("Starting Server Aggregation (Clustered)...\n")
@@ -320,6 +385,22 @@ def parse_args():
                         help="Expert assignment strategy after clustering")
     parser.add_argument("--assignment_margin_delta", type=float, default=0.0,
                         help="Minimum similarity improvement required to switch primary expert")
+    parser.add_argument("--enable_rank_dropout", action="store_true",
+                        help="Enable rank-wise dropout for SVD-LoRA layers")
+    parser.add_argument("--p_base", type=float, default=0.0,
+                        help="Base probability for SVD-LoRA rank-wise dropout")
+    parser.add_argument("--dropout_warmup_rounds", type=int, default=0,
+                        help="Global rounds before rank-wise dropout starts")
+    parser.add_argument("--dropout_ramp_rounds", type=int, default=0,
+                        help="Global rounds used to ramp rank-wise dropout gamma")
+    parser.add_argument("--dropout_stop_round", type=int, default=-1,
+                        help="Global round at which rank-wise dropout is disabled; -1 means never")
+    parser.add_argument("--lambda_e", type=float, default=1.0,
+                        help="Rank importance weight for SVD e")
+    parser.add_argument("--lambda_b", type=float, default=1.0,
+                        help="Rank importance weight for LoRA B")
+    parser.add_argument("--lambda_a", type=float, default=1.0,
+                        help="Rank importance weight for LoRA A")
     
     return parser.parse_args()
 
@@ -331,6 +412,16 @@ def main():
     client_num = len(task_name_list)
     
     output_dir = os.path.join(args.output_dir, f"{args.model_name.replace('/', '_')}_multi_task_federated_{client_num}")
+    rank_dropout_config = {
+        "enable_rank_dropout": args.enable_rank_dropout,
+        "p_base": args.p_base,
+        "dropout_warmup_rounds": args.dropout_warmup_rounds,
+        "dropout_ramp_rounds": args.dropout_ramp_rounds,
+        "dropout_stop_round": args.dropout_stop_round,
+        "lambda_e": args.lambda_e,
+        "lambda_b": args.lambda_b,
+        "lambda_a": args.lambda_a,
+    }
     
     print(f"Running federated learning with multi-task datasets: {task_name_list}")
     print(f"Number of clients: {client_num}")
@@ -358,7 +449,8 @@ def main():
         model_name=args.model_name,
         num_clients=client_num,
         rank=args.rank,
-        cache_path=output_dir
+        cache_path=output_dir,
+        rank_dropout_config=rank_dropout_config
     )
     dummy.set_dataset(client_datasets[0], dummy_num_labels)
     
@@ -374,7 +466,8 @@ def main():
             model_name=args.model_name,
             num_clients=client_num,
             rank=args.rank,
-            cache_path=output_dir
+            cache_path=output_dir,
+            rank_dropout_config=rank_dropout_config
         )
         client.set_dataset(client_datasets[client_id], num_labels)
         warmup_clients.append(client)

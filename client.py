@@ -13,7 +13,20 @@ from peft import LoraConfig, TaskType, get_peft_model
 
 
 class Client:
-    def __init__(self, client_id, task_name, tokenizer, model_name, num_clients, rank=8, lora_n=4, adaptive=False, cache_path="./output", idx=None):
+    def __init__(
+        self,
+        client_id,
+        task_name,
+        tokenizer,
+        model_name,
+        num_clients,
+        rank=8,
+        lora_n=4,
+        adaptive=False,
+        cache_path="./output",
+        idx=None,
+        rank_dropout_config=None
+    ):
         self.client_id = client_id
         self.task_name = task_name
         self.tokenizer = tokenizer
@@ -28,6 +41,7 @@ class Client:
         self.datasets = None
         self.num_labels = None
         self.idx = idx
+        self.rank_dropout_config = rank_dropout_config or {}
         
     def set_dataset(self, dataset, num_labels):
         self.datasets = dataset
@@ -52,7 +66,8 @@ class Client:
                 adaptive=self.adaptive,
                 idx=self.idx,
                 k=self.lora_n,
-                bias="none"
+                bias="none",
+                **self.rank_dropout_config
             )
             
             self.local_model = get_peft_model(self.local_model, peft_config)
@@ -123,8 +138,61 @@ class Client:
             self.local_model.load_adapter(params_or_path, adapter_name="default")
             
 
-    def local_training(self, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1, lora_client_map=None):
+    def _compute_rank_dropout_gamma(self, current_round=None, is_warmup=False):
+        if is_warmup or not self.rank_dropout_config.get("enable_rank_dropout", False):
+            return 0.0
+        if current_round is None:
+            return 0.0
+
+        stop_round = self.rank_dropout_config.get("dropout_stop_round", -1)
+        if stop_round >= 0 and current_round >= stop_round:
+            return 0.0
+
+        warmup_rounds = self.rank_dropout_config.get("dropout_warmup_rounds", 0)
+        if current_round < warmup_rounds:
+            return 0.0
+
+        ramp_rounds = self.rank_dropout_config.get("dropout_ramp_rounds", 0)
+        if ramp_rounds <= 0:
+            return 1.0
+
+        ramp_progress = (current_round - warmup_rounds + 1) / ramp_rounds
+        return float(max(0.0, min(1.0, ramp_progress)))
+
+    def _set_rank_dropout_gamma(self, gamma):
+        for module in self.local_model.modules():
+            if hasattr(module, "set_rank_dropout_gamma"):
+                module.set_rank_dropout_gamma(gamma)
+
+    def _collect_rank_dropout_stats(self):
+        stats = []
+        for module in self.local_model.modules():
+            if hasattr(module, "get_rank_dropout_stats"):
+                module_stats = module.get_rank_dropout_stats()
+                if module_stats is not None:
+                    stats.append(module_stats)
+
+        if not stats:
+            return None
+
+        return {
+            "dropout_rate": float(np.mean([item["dropout_rate"] for item in stats])),
+            "rank_importance": float(np.mean([item["rank_importance"] for item in stats])),
+        }
+
+    def local_training(
+        self,
+        lr=2e-4,
+        epochs=1,
+        batch_size=32,
+        gradient_accumulation_steps=1,
+        lora_client_map=None,
+        current_round=None,
+        is_warmup=False
+    ):
         self.local_model.train()
+        gamma = self._compute_rank_dropout_gamma(current_round=current_round, is_warmup=is_warmup)
+        self._set_rank_dropout_gamma(gamma)
 
         if lora_client_map is None:
             raise ValueError("lora_client_map is required for local_training after warmup")
@@ -189,6 +257,7 @@ class Client:
         )
 
         trainer.train()
+        return self._collect_rank_dropout_stats()
         
     def evaluate_model(self, output_file=None):
         self.local_model.eval()
@@ -231,9 +300,20 @@ class Client:
 
 
 class WarmupClient(Client):
-    def __init__(self, client_id, task_name, tokenizer, model_name, num_clients, rank=8, cache_path="./output"):
+    def __init__(self, client_id, task_name, tokenizer, model_name, num_clients, rank=8, cache_path="./output", rank_dropout_config=None):
         
-        super().__init__(client_id, task_name, tokenizer, model_name, num_clients, rank, lora_n=1, adaptive=False, cache_path=cache_path)
+        super().__init__(
+            client_id,
+            task_name,
+            tokenizer,
+            model_name,
+            num_clients,
+            rank,
+            lora_n=1,
+            adaptive=False,
+            cache_path=cache_path,
+            rank_dropout_config=rank_dropout_config
+        )
         
     def load_model(self):
         
@@ -255,7 +335,8 @@ class WarmupClient(Client):
                 adaptive=False, 
                 idx=0,  
                 k=1, 
-                bias="none"
+                bias="none",
+                **self.rank_dropout_config
             )
             
             self.local_model = get_peft_model(self.local_model, peft_config)
@@ -263,8 +344,17 @@ class WarmupClient(Client):
             if self.current_params is not None:
                 self.load_params(self.current_params)
 
-    def local_training(self, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1):
+    def local_training(
+        self,
+        lr=2e-4,
+        epochs=1,
+        batch_size=32,
+        gradient_accumulation_steps=1,
+        current_round=None,
+        is_warmup=True
+    ):
         self.local_model.train()
+        self._set_rank_dropout_gamma(0.0)
 
         for name, param in self.local_model.named_parameters():
             if 'lora_A' in name or 'lora_B' in name or 'lora_svd_e' in name:
@@ -304,6 +394,7 @@ class WarmupClient(Client):
         )
 
         trainer.train()
+        return self._collect_rank_dropout_stats()
 
     def get_lora_params(self):
         lora_params = {

@@ -27,7 +27,9 @@ def train_federated(
     task_info=None,
     client_datasets=None,
     batch_size=128,
-    similarity_type="fedlease_original"
+    similarity_type="fedlease_original",
+    assignment_type="fedlease_top_m",
+    assignment_margin_delta=0.0
 ):
     personal_dir = os.path.join(output_dir, "proposed_m2")
     os.makedirs(personal_dir, exist_ok=True)
@@ -99,7 +101,9 @@ def train_federated(
                     round_idx, 
                     personal_dir,
                     max_clusters=max_clusters,
-                    similarity_type=similarity_type
+                    similarity_type=similarity_type,
+                    assignment_type=assignment_type,
+                    assignment_margin_delta=assignment_margin_delta
                 )
                 agg_lora_client_map = lora_client_map
                 
@@ -201,6 +205,9 @@ def train_federated(
                                 warmed_params[new_name] = param
                             elif 'lora_B0' in name and client_group is not None:
                                 new_name = name.replace('lora_B0', f'lora_B{client_group}')
+                                warmed_params[new_name] = param
+                            elif 'lora_svd_e0' in name and client_group is not None:
+                                new_name = name.replace('lora_svd_e0', f'lora_svd_e{client_group}')
                                 warmed_params[new_name] = param
                             elif 'lora_route' in name:
                                 continue
@@ -308,6 +315,11 @@ def parse_args():
     parser.add_argument("--similarity_type", type=str, default="fedlease_original",
                         choices=["fedlease_original", "svd_b_e"],
                         help="Client similarity backend for clustering")
+    parser.add_argument("--assignment_type", type=str, default="fedlease_top_m",
+                        choices=["fedlease_top_m", "hard_primary"],
+                        help="Expert assignment strategy after clustering")
+    parser.add_argument("--assignment_margin_delta", type=float, default=0.0,
+                        help="Minimum similarity improvement required to switch primary expert")
     
     return parser.parse_args()
 
@@ -382,7 +394,9 @@ def main():
         task_info=task_info,
         client_datasets=client_datasets,
         batch_size=args.batch_size,
-        similarity_type=args.similarity_type
+        similarity_type=args.similarity_type,
+        assignment_type=args.assignment_type,
+        assignment_margin_delta=args.assignment_margin_delta
     )
     
     print("\nTraining completed!")

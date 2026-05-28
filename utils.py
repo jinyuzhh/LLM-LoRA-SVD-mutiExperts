@@ -576,6 +576,91 @@ def log_similarity_matrix_stats(matrix, label, log_file=None):
             f.write(stats_msg + "\n")
 
 
+def select_expert_medoids(similarity_matrix, lora_client_map):
+    medoids = {}
+
+    for expert_id, client_indices in lora_client_map.items():
+        if not client_indices:
+            continue
+
+        if len(client_indices) == 1:
+            medoids[int(expert_id)] = client_indices[0]
+            continue
+
+        best_client = None
+        best_score = -float("inf")
+
+        for client_idx in client_indices:
+            other_clients = [idx for idx in client_indices if idx != client_idx]
+            avg_similarity = float(np.mean(similarity_matrix[client_idx, other_clients]))
+
+            if avg_similarity > best_score:
+                best_score = avg_similarity
+                best_client = client_idx
+
+        medoids[int(expert_id)] = best_client
+
+    return medoids
+
+
+def apply_hard_primary_assignment(similarity_matrix, lora_client_map, assignment_margin_delta=0.0):
+    medoids = select_expert_medoids(similarity_matrix, lora_client_map)
+    old_expert_by_client = {}
+
+    for expert_id, client_indices in lora_client_map.items():
+        for client_idx in client_indices:
+            old_expert_by_client[client_idx] = int(expert_id)
+
+    hard_map = {int(expert_id): [] for expert_id in lora_client_map.keys()}
+    assignment_details = {}
+    switch_count = 0
+
+    for client_idx in sorted(old_expert_by_client):
+        old_expert = old_expert_by_client[client_idx]
+        old_medoid = medoids[old_expert]
+        old_similarity = float(similarity_matrix[client_idx, old_medoid])
+
+        best_expert = old_expert
+        best_similarity = old_similarity
+
+        for expert_id, medoid_idx in medoids.items():
+            candidate_similarity = float(similarity_matrix[client_idx, medoid_idx])
+            if candidate_similarity > best_similarity:
+                best_similarity = candidate_similarity
+                best_expert = expert_id
+
+        switched = best_expert != old_expert and (best_similarity - old_similarity) > assignment_margin_delta
+        final_expert = best_expert if switched else old_expert
+
+        if switched:
+            switch_count += 1
+
+        hard_map[final_expert].append(client_idx)
+        assignment_details[client_idx] = {
+            "old_expert": old_expert,
+            "final_expert": final_expert,
+            "old_similarity": old_similarity,
+            "best_similarity": best_similarity,
+            "switched": switched,
+        }
+
+    return hard_map, medoids, assignment_details, switch_count
+
+
+def log_assignment_summary(lora_client_map, log_file, title="Expert assignment"):
+    lines = [title]
+    for expert_id in sorted(lora_client_map, key=int):
+        clients = lora_client_map[expert_id]
+        lines.append(f"  Expert {expert_id}: {len(clients)} clients -> {clients}")
+
+    for line in lines:
+        print(line)
+
+    with open(log_file, "a") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+
 def visualize_clustering(combined_matrix, client_ids, labels, output_dir, round_idx):
     os.makedirs(output_dir, exist_ok=True)
     
@@ -609,11 +694,21 @@ def visualize_clustering(combined_matrix, client_ids, labels, output_dir, round_
     plt.close()
 
 
-def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=10, similarity_type="fedlease_original"):
+def compute_lora_client_map(
+    clients,
+    round_idx,
+    personal_dir="./",
+    max_clusters=10,
+    similarity_type="fedlease_original",
+    assignment_type="fedlease_top_m",
+    assignment_margin_delta=0.0
+):
     if similarity_type not in {"fedlease_original", "svd_b_e"}:
         raise ValueError("similarity_type must be either 'fedlease_original' or 'svd_b_e'")
+    if assignment_type not in {"fedlease_top_m", "hard_primary"}:
+        raise ValueError("assignment_type must be either 'fedlease_top_m' or 'hard_primary'")
 
-    print(f"Computing LoRA client map using similarity_type={similarity_type}...")
+    print(f"Computing LoRA client map using similarity_type={similarity_type}, assignment_type={assignment_type}...")
     
     from sklearn.metrics import silhouette_score, davies_bouldin_score
     
@@ -626,6 +721,8 @@ def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=
     with open(log_file, "a") as f:
         f.write("\nStarting LoRA client mapping calculation...\n")
         f.write(f"Similarity type: {similarity_type}\n")
+        f.write(f"Assignment type: {assignment_type}\n")
+        f.write(f"Assignment margin delta: {assignment_margin_delta}\n")
     
     all_distance_matrices = {}
     
@@ -744,6 +841,36 @@ def compute_lora_client_map(clients, round_idx, personal_dir="./", max_clusters=
     for cluster_id in range(optimal_n_clusters):
         client_indices = [i for i, label in enumerate(optimal_labels) if label == cluster_id]
         lora_client_map[cluster_id] = client_indices
+
+    if assignment_type == "hard_primary":
+        similarity_matrix = 1 - combined_matrix
+        lora_client_map, medoids, assignment_details, switch_count = apply_hard_primary_assignment(
+            similarity_matrix,
+            lora_client_map,
+            assignment_margin_delta=assignment_margin_delta
+        )
+
+        with open(log_file, "a") as f:
+            f.write("\nHard-primary assignment refinement:\n")
+            for expert_id in sorted(medoids):
+                f.write(f"  Expert {expert_id} medoid client: {medoids[expert_id]}\n")
+            f.write(f"  Client switches this round: {switch_count}\n")
+            for client_idx in sorted(assignment_details):
+                details = assignment_details[client_idx]
+                f.write(
+                    f"  Client {client_idx}: old_expert={details['old_expert']}, "
+                    f"final_expert={details['final_expert']}, "
+                    f"old_similarity={details['old_similarity']:.6f}, "
+                    f"best_similarity={details['best_similarity']:.6f}, "
+                    f"switched={details['switched']}\n"
+                )
+
+        print("\nHard-primary assignment refinement:")
+        for expert_id in sorted(medoids):
+            print(f"  Expert {expert_id} medoid client: {medoids[expert_id]}")
+        print(f"  Client switches this round: {switch_count}")
+
+    log_assignment_summary(lora_client_map, log_file, title="Clients per expert after assignment")
     
     print("\nClustering Results:")
     with open(log_file, "a") as f:

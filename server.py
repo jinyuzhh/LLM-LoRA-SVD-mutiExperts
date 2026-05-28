@@ -46,7 +46,7 @@ class Server:
                     continue
 
                 for base_param_name in list(gpu_params[0].keys()):
-                    if 'lora_A0' in base_param_name or 'lora_B0' in base_param_name:
+                    if 'lora_A0' in base_param_name or 'lora_B0' in base_param_name or 'lora_svd_e0' in base_param_name:
                         target_param_name = base_param_name.replace('0', str(group_idx))
 
                         try:
@@ -66,7 +66,7 @@ class Server:
         else:
             for client_idx in range(num_clients):
                 for param_name, param_value in gpu_params[client_idx].items():
-                    if 'lora_A' in param_name or 'lora_B' in param_name or 'lora_route' in param_name:
+                    if 'lora_A' in param_name or 'lora_B' in param_name or 'lora_svd_e' in param_name or 'lora_route' in param_name:
                         aggregated_results[client_idx][param_name] = param_value
 
         return aggregated_results
@@ -109,27 +109,13 @@ class Server:
                     else:
                         aggregated_results[client_idx][param_name] = gpu_params[client_idx][param_name]
 
-                elif 'lora_A' in param_name:
-                    lora_idx = int(param_name.split('lora_A')[1][0])
-
-                    group_indices = self.lora_client_map.get(str(lora_idx), [])
-                    if not group_indices:
-                        group_indices = self.lora_client_map.get(lora_idx, [])
-
-                    if group_indices:
-                        stacked_params = torch.stack([
-                            gpu_params[i][param_name]
-                            for i in group_indices if i < len(gpu_params) and param_name in gpu_params[i]
-                        ]).to(self.device)
-                        if stacked_params.size(0) > 0:
-                            aggregated_results[client_idx][param_name] = stacked_params.mean(dim=0)
-                        else:
-                            aggregated_results[client_idx][param_name] = gpu_params[client_idx][param_name]
+                elif 'lora_A' in param_name or 'lora_B' in param_name or 'lora_svd_e' in param_name:
+                    if 'lora_A' in param_name:
+                        lora_idx = int(param_name.split('lora_A')[1][0])
+                    elif 'lora_B' in param_name:
+                        lora_idx = int(param_name.split('lora_B')[1][0])
                     else:
-                        aggregated_results[client_idx][param_name] = gpu_params[client_idx][param_name]
-
-                elif 'lora_B' in param_name:
-                    lora_idx = int(param_name.split('lora_B')[1][0])
+                        lora_idx = int(param_name.split('lora_svd_e')[1][0])
 
                     group_indices = self.lora_client_map.get(str(lora_idx), [])
                     if not group_indices:
